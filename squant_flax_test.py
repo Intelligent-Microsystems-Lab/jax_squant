@@ -502,7 +502,7 @@ class SQuantFlaxTest(parameterized.TestCase):
     """
     Unit test to check whether our Flax implementation produces parameters.
     """
-    data = np.load('unit_test_data/' + inpt_path)
+    data = np.load('../squant_unit_test_too_big/' + inpt_path)
 
     params = uniform_static(bits=bits, percent=sigma, sign=sign).init({}, data)
 
@@ -516,15 +516,13 @@ class SQuantFlaxTest(parameterized.TestCase):
     """
     Unit test to match PyTorch input quant to flax input quant.
     """
-    data = np.load('unit_test_data/' + inpt_path)
-    out = np.load('unit_test_data/' + inpt_path.split('.')[0] + '_out.npy')
+    data = np.load('../squant_unit_test_too_big/' + inpt_path)
+    out = np.load('../squant_unit_test_too_big/' + inpt_path.split('.')[0] + '_out.npy')
 
     params = uniform_static(bits=bits, percent=sigma, sign=sign).init({}, data)
     test = uniform_static(bits=bits, percent=sigma,
                           sign=sign).apply(params, data)
 
-    import pdb
-    pdb.set_trace()
     np.testing.assert_allclose(test, out, atol=numerical_tolerance)
 
 
