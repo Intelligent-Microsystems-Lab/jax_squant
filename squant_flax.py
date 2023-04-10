@@ -1,7 +1,7 @@
 # Author: Clemens JS Schaefer
 # Implementation of SQuant
 # https://arxiv.org/pdf/2202.07471.pdf
-# base on https://github.com/clevercool/SQuant
+# based on https://github.com/clevercool/SQuant
 
 import functools
 import numpy as np
