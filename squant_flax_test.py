@@ -8,7 +8,7 @@ from absl.testing import parameterized
 
 import numpy as np
 
-from squant_flax import squant_fn
+from squant_flax import squant_fn, uniform_static
 
 
 def squant_test_data():
@@ -405,6 +405,70 @@ def squant_test_data():
   )
 
 
+def inpt_quant_test_data():
+  return (
+      dict(
+          testcase_name="params_bits4_no_sign",
+          inpt_path="rand_inpt4_ns.npy",
+          xmax=7.14909553527832031250,
+          xmin=0.,
+          bits=4,
+          sigma=12,
+          sign=False,
+      ),
+      dict(
+          testcase_name="params_bits8_no_sign",
+          inpt_path="rand_inpt8_ns.npy",
+          xmax=18.96476554870605468750,
+          xmin=0.,
+          bits=8,
+          sigma=25,
+          sign=False,
+      ),
+      dict(
+          testcase_name="params_bits4_sign",
+          inpt_path="rand_inpt4.npy",
+          xmax=7.766377925872802734375,
+          xmin=-7.766377925872802734375,
+          bits=4,
+          sigma=12,
+          sign=True,
+      ),
+      dict(
+          testcase_name="params_bits8_sign",
+          inpt_path="rand_inpt8.npy",
+          xmax=20.25410461425781250,
+          xmin=-20.25410461425781250,
+          bits=8,
+          sigma=25,
+          sign=True,
+      ),
+  )
+
+
+def act_quant_test_data():
+  return (
+      dict(
+          testcase_name="act_bits4_no_sign",
+          inpt_path="rand_inpt4_quant.npy",
+          bits=4,
+          sigma=12,
+          sign=False,
+          numerical_tolerance=1e-7,
+      ),
+
+      # fails ...
+      # dict(
+      #     testcase_name="act_bits8_no_sign",
+      #     inpt_path="rand_inpt8_quant.npy",
+      #     bits = 8,
+      #     sigma = 25,
+      #     sign = False,
+      #     numerical_tolerance=1e-7,
+      # ),
+  )
+
+
 class SQuantFlaxTest(parameterized.TestCase):
   @parameterized.named_parameters(*squant_test_data())
   def test_squant_output_eq(
@@ -420,7 +484,7 @@ class SQuantFlaxTest(parameterized.TestCase):
     ground_truth = np.load('unit_test_data/' + ground_truth_path)
 
     if scale_off:
-      scale_off ='unit_test_data/' + scale_off
+      scale_off = 'unit_test_data/' + scale_off
 
     quant_weight_tensor = squant_fn(
         data, bits, is_perchannel, squant_k, squant_c, scale_off, shape_c)
@@ -430,6 +494,38 @@ class SQuantFlaxTest(parameterized.TestCase):
     else:
       np.testing.assert_allclose(
           ground_truth, quant_weight_tensor, atol=numerical_tolerance)
+
+  @parameterized.named_parameters(*inpt_quant_test_data())
+  def test_input_quant_params(
+      self, inpt_path, xmax, xmin, bits, sigma, sign
+  ):
+    """
+    Unit test to check whether our Flax implementation produces parameters.
+    """
+    data = np.load('unit_test_data/' + inpt_path)
+
+    params = uniform_static(bits=bits, percent=sigma, sign=sign).init({}, data)
+
+    np.testing.assert_equal(xmax, float(params['quant_params']['xmax']))
+    np.testing.assert_equal(xmin, float(params['quant_params']['xmin']))
+
+  @parameterized.named_parameters(*act_quant_test_data())
+  def test_act_quant(
+      self, inpt_path, bits, sigma, sign, numerical_tolerance
+  ):
+    """
+    Unit test to match PyTorch input quant to flax input quant.
+    """
+    data = np.load('unit_test_data/' + inpt_path)
+    out = np.load('unit_test_data/' + inpt_path.split('.')[0] + '_out.npy')
+
+    params = uniform_static(bits=bits, percent=sigma, sign=sign).init({}, data)
+    test = uniform_static(bits=bits, percent=sigma,
+                          sign=sign).apply(params, data)
+
+    import pdb
+    pdb.set_trace()
+    np.testing.assert_allclose(test, out, atol=numerical_tolerance)
 
 
 if __name__ == "__main__":

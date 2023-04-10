@@ -10,6 +10,8 @@ import jax
 import jaxlib
 import jax.numpy as jnp
 
+from flax import linen as nn
+
 
 def SQuant_func(flip_number, flip_up_number, flip_down_number,
                 rounding_error_sum, rounding_number, rounding_error,
@@ -290,7 +292,7 @@ def adaptive_round(x, t_min=None, t_max=None, squant_k='make that required',
 
 
 def squant_fn(tensor, bit, is_perchannel, squant_k, squant_c, scale_off=False,
-  shape_c=False):
+              shape_c=False):
 
   if shape_c is False:
     # reshuffle axis to match pytorch.
@@ -335,19 +337,66 @@ def squant_fn(tensor, bit, is_perchannel, squant_k, squant_c, scale_off=False,
   return quant_tensor
 
 
-# def squant_act_fn(tensor, bit, sigma, is_signed):
-#   raise Exception('Not implemented yet, probably done via quantizer fn.')
-#   alpha = percent * jnp.abs(data).max()
-#   if is_sigma:
-#     sigma = sigma_fn(data, is_signed)
-#     alpha = percent * sigma
-#     if is_signed:
-#       # We also consider the signed activation. Other framworks will
-#       # skip this tensor.
-#       alpha = percent * sigma / 1.25
+class uniform_static(nn.Module):
+  bits: int = 4
+  percent: float = 12.
+  sign: bool = True
 
-#     # For a higher bit-width, using a wider range still will not cause
-#     # accuracy loss.
-#     if bit < 6:
-#       # For small bit, need clip.
-#       alpha = min(alpha, x_max)
+  @nn.compact
+  def __call__(self, x, no_quant=False):
+    if type(self.bits) == int:
+      assert (
+          self.bits > 1
+      ), "Bit widths below 2 bits are not supported but got bits: "\
+          + str(self.bits)
+
+    if no_quant:
+      return x
+
+    xmax = self.variable(
+        'quant_params', 'xmax', jnp.zeros, (1,))
+    xmin = self.variable(
+        'quant_params', 'xmin', jnp.zeros, (1,))
+
+    if self.is_mutable_collection('quant_params'):
+
+      x_max = jnp.max(x)
+      alpha = self.percent * jnp.abs(x).max()
+
+      if not self.sign:
+        sigma = jnp.nanstd(jnp.where(x > 0, x, jnp.nan))
+      else:
+        sigma = jnp.std(x)
+
+      alpha = sigma * self.percent
+      if self.sign:
+        alpha = self.percent * sigma / 1.25
+
+      if self.bits < 6:
+        # For small bit, need clip.
+        alpha = jnp.minimum(alpha, x_max)
+
+      if self.sign:
+        xmin.value = -alpha
+      else:
+        xmin.value = jnp.zeros_like(alpha)
+      xmax.value = alpha
+
+    scale, zero_point = asymmetric_linear_quantization_params(
+        self.bits, xmin.value, xmax.value, integral_zero_point=True,
+        signed=self.sign)
+
+    new_quant_x = jnp.round(linear_quantize(
+        x, scale, zero_point, inplace=False))
+    n = 2**(self.bits - 1)
+    if self.sign:
+      new_quant_x = jnp.clip(new_quant_x, -n, n - 1)
+    else:
+      new_quant_x = jnp.clip(new_quant_x, 0, 2 * n - 1)
+
+    quant_x = linear_dequantize(new_quant_x,
+                                scale,
+                                zero_point,
+                                inplace=False)
+
+    return quant_x

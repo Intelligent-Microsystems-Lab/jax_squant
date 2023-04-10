@@ -18,18 +18,20 @@ class TrainState(struct.PyTreeNode):
   step: int
   apply_fn: Callable = struct.field(pytree_node=False)
   params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+  quant_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
   batch_stats: Any
   tx: optax.GradientTransformation = struct.field(pytree_node=False)
   opt_state: optax.OptState = struct.field(pytree_node=True)
   dynamic_scale: dynamic_scale_lib.DynamicScale = None
 
   @classmethod
-  def create(cls, *, apply_fn, params, tx, **kwargs):
+  def create(cls, *, apply_fn, params, quant_params, tx, **kwargs):
     """Creates a new instance with `step=0` and initialized `opt_state`."""
     return cls(
         step=0,
         apply_fn=apply_fn,
         params=params,
+        quant_params=quant_params,
         tx=None,
         opt_state=None,
         **kwargs,
@@ -180,6 +182,7 @@ def resnet_load_pretrained_weights(state, location):
   return TrainState.create(
       apply_fn=state.apply_fn,
       params=freeze(general_params),
+      quant_params=state.quant_params,
       tx=state.tx,
       batch_stats=freeze(batch_stats),
   )

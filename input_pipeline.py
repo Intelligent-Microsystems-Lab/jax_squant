@@ -117,8 +117,8 @@ def _decode_and_center_crop(image_bytes, image_size):
   image_width = shape[1]
 
   padded_center_crop_size = tf.cast(
-      ((image_size / (image_size + CROP_PADDING)) *
-       tf.cast(tf.minimum(image_height, image_width), tf.float32)),
+      ((image_size / (image_size + CROP_PADDING))
+       * tf.cast(tf.minimum(image_height, image_width), tf.float32)),
       tf.int32)
 
   offset_height = ((image_height - padded_center_crop_size) + 1) // 2

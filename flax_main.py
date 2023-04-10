@@ -32,14 +32,14 @@ import tensorflow_datasets as tfds
 
 import input_pipeline
 from resnet_load_pretrained_weights import resnet_load_pretrained_weights
-from squant_flax import squant_fn
+from squant_flax import squant_fn, uniform_static
 
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer('rng', 69, 'Random seed.')
 flags.DEFINE_string('model', 'ResNet18', 'Model type.')
-flags.DEFINE_integer('batch_size', 128, 'Batch size.')
+flags.DEFINE_integer('batch_size', 256, 'Batch size.')
 flags.DEFINE_string(
     'tfds_data_dir', '/afs/crc.nd.edu/user/c/cschaef6/tensorflow_datasets', '')
 flags.DEFINE_string('dataset', 'imagenet2012:5.*.*', '')
@@ -47,9 +47,10 @@ flags.DEFINE_bool('cache', False, '')
 flags.DEFINE_bool('half_precision', False, '')
 
 flags.DEFINE_string('model_weights', 'unit_test_data/res18_w.pt',
-    'Pretrained model weights location.')
+                    'Pretrained model weights location.')
 flags.DEFINE_integer('wb', 4, 'Weight bits.')
 flags.DEFINE_integer('ab', 4, 'Activation bits.')
+flags.DEFINE_float('sigma', 12., 'Sigma for weight parameter init.')
 
 NUM_CLASSES = 1000
 
@@ -63,10 +64,15 @@ class ResNetBlock(nn.Module):
   norm: ModuleDef
   act: Callable
   strides: Tuple[int, int] = (1, 1)
+  quant_fn: Callable = None
 
   @nn.compact
-  def __call__(self, x,):
+  def __call__(self, x, no_quant):
     residual = x
+
+    # quant inpt
+    x = self.quant_fn(sign=False)(x, no_quant=no_quant)
+
     if self.strides == (2, 2):
       y = self.conv(self.filters, (3, 3), self.strides,
                     padding=((1, 0), (1, 0)))(x)
@@ -79,10 +85,18 @@ class ResNetBlock(nn.Module):
     y = self.norm()(y)
     y = self.act(y)
     # block #1 Max absolute difference: 5.722046e-06
+
+    # quant inpt
+    y = self.quant_fn(sign=False)(y, no_quant=no_quant)
+
     y = self.conv(self.filters, (3, 3))(y)
     y = self.norm(scale_init=nn.initializers.zeros_init())(y)
 
     if residual.shape != y.shape:
+
+      # quant inpt
+      residual = self.quant_fn(sign=False)(residual, no_quant=no_quant)
+
       residual = self.conv(self.filters, (1, 1),
                            self.strides, name='conv_proj')(residual)
       residual = self.norm(name='norm_proj')(residual)
@@ -130,9 +144,11 @@ class ResNet(nn.Module):
   dtype: Any = jnp.float32
   act: Callable = nn.relu
   conv: ModuleDef = nn.Conv
+  quant_fn: Callable = None
 
   @nn.compact
-  def __call__(self, x, train: bool = True):
+  def __call__(self, x, no_quant: bool = False):
+    train = False
     conv = functools.partial(self.conv, use_bias=False, dtype=self.dtype)
     norm = functools.partial(nn.BatchNorm,
                              use_running_average=not train,
@@ -140,6 +156,9 @@ class ResNet(nn.Module):
                              epsilon=1e-5,
                              dtype=self.dtype,
                              axis_name='batch')
+
+    # quant inpt
+    # x = self.quant_fn(sign = False)(x, no_quant = no_quant)
 
     x = conv(self.num_filters, (7, 7), (2, 2),
              padding=[(3, 3), (3, 3)],
@@ -164,8 +183,13 @@ class ResNet(nn.Module):
                            strides=strides,
                            conv=conv,
                            norm=norm,
-                           act=self.act)(x)
+                           act=self.act,
+                           quant_fn=self.quant_fn)(x, no_quant=no_quant)
     x = jnp.mean(x, axis=(1, 2))
+
+    # quant inpt
+    x = self.quant_fn(sign=False)(x, no_quant=no_quant)
+
     x = nn.Dense(self.num_classes, dtype=self.dtype)(x)
     x = jnp.asarray(x, self.dtype)
     return x
@@ -185,7 +209,7 @@ ResNet200 = functools.partial(ResNet, stage_sizes=[3, 24, 36, 3],
                               block_cls=BottleneckResNetBlock)
 
 
-def create_model(*, model_cls, half_precision, **kwargs):
+def create_model(*, model_cls, quant_fn, half_precision, **kwargs):
   platform = jax.local_devices()[0].platform
   if half_precision:
     if platform == 'tpu':
@@ -194,7 +218,8 @@ def create_model(*, model_cls, half_precision, **kwargs):
       model_dtype = jnp.float16
   else:
     model_dtype = jnp.float32
-  return model_cls(num_classes=NUM_CLASSES, dtype=model_dtype, **kwargs)
+  return model_cls(num_classes=NUM_CLASSES, quant_fn=quant_fn,
+                   dtype=model_dtype, **kwargs)
 
 
 def initialized(key, image_size, model):
@@ -204,7 +229,8 @@ def initialized(key, image_size, model):
   def init(*args):
     return model.init(*args)
   variables = init({'params': key}, jnp.ones(input_shape, model.dtype))
-  return variables['params'], variables['batch_stats']
+  return variables['params'], variables['quant_params'], \
+      variables['batch_stats']
 
 
 def cross_entropy_loss(logits, labels):
@@ -224,10 +250,11 @@ def compute_metrics(logits, labels):
   return metrics
 
 
-def eval_step(state, batch):
-  variables = {'params': state.params, 'batch_stats': state.batch_stats}
+def eval_step(state, batch, no_quant):
+  variables = {'params': state.params, 'quant_params': state.quant_params,
+               'batch_stats': state.batch_stats}
   logits = state.apply_fn(
-      variables, batch['image'], train=False, mutable=False)
+      variables, batch['image'], mutable=False, no_quant=no_quant)
   return compute_metrics(logits, batch['label'])
 
 
@@ -271,18 +298,20 @@ class TrainState(struct.PyTreeNode):
   step: int
   apply_fn: Callable = struct.field(pytree_node=False)
   params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+  quant_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
   batch_stats: Any
   tx: optax.GradientTransformation = struct.field(pytree_node=False)
   opt_state: optax.OptState = struct.field(pytree_node=True)
   dynamic_scale: dynamic_scale_lib.DynamicScale = None
 
   @classmethod
-  def create(cls, *, apply_fn, params, tx, **kwargs):
+  def create(cls, *, apply_fn, params, quant_params, tx, **kwargs):
     """Creates a new instance with `step=0` and initialized `opt_state`."""
     return cls(
         step=0,
         apply_fn=apply_fn,
         params=params,
+        quant_params=quant_params,
         tx=None,
         opt_state=None,
         **kwargs,
@@ -293,11 +322,11 @@ def create_train_state(rng, config: ml_collections.ConfigDict,
                        model, image_size):
   """Create initial training state."""
 
-  params, batch_stats = initialized(rng, image_size, model)
-
+  params, quant_params, batch_stats = initialized(rng, image_size, model)
   state = TrainState.create(
       apply_fn=model.apply,
       params=params,
+      quant_params=quant_params,
       tx=None,
       batch_stats=batch_stats,
   )
@@ -334,9 +363,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     input_dtype = tf.float32
 
   dataset_builder = tfds.builder(config.dataset, data_dir=config.tfds_data_dir)
-  # train_iter = create_input_iter(
-  #     dataset_builder, local_batch_size, image_size, input_dtype, train=True,
-  #     cache=config.cache)
   eval_iter = create_input_iter(
       dataset_builder, local_batch_size, image_size, input_dtype, train=False,
       cache=config.cache)
@@ -345,19 +371,25 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
       'validation'].num_examples
   steps_per_eval = num_validation_examples // config.batch_size
 
+  quant_fn = functools.partial(
+      uniform_static, bits=FLAGS.ab, percent=FLAGS.sigma, sign=False,)
+
   model_cls = globals()[config.model]
   model = create_model(
-      model_cls=model_cls, half_precision=config.half_precision)
+      model_cls=model_cls, quant_fn=quant_fn,
+      half_precision=config.half_precision)
 
+  rng, rng_key = jax.random.split(rng, 2)
   state = create_train_state(
-      rng, config, model, image_size)
+      rng_key, config, model, image_size)
   # restore pretrained NN
   # state = restore_checkpoint(
   #     state, '/afs/crc.nd.edu/user/c/cschaef6/pretrained_resnet/resnet18')
   state = resnet_load_pretrained_weights(state, FLAGS.model_weights)
   logging.info('Model loaded successfully.')
   state = jax_utils.replicate(state)
-  p_eval_step = jax.pmap(eval_step, axis_name='batch')
+  p_eval_step = jax.pmap(functools.partial(
+      eval_step, no_quant=True), axis_name='batch')
 
   eval_metrics = []
   for _ in range(steps_per_eval):
@@ -384,7 +416,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
 
   jsquant_fn = jax.jit(functools.partial(
       squant_fn, bit=FLAGS.wb, is_perchannel=True, squant_k=True,
-        squant_c=True, scale_off=False))
+      squant_c=True, scale_off=False))
 
   def quant_single(path, x):
     if ('kernel' in path):  # bias quant maybe not done?
@@ -405,11 +437,37 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   state = TrainState.create(
       apply_fn=state.apply_fn,
       params=qweights,
+      quant_params=state.quant_params,
       tx=state.tx,
       batch_stats=state.batch_stats,
   )
 
+  # calibrate activatin quant.
+  rng, rng_key1, rng_key2 = jax.random.split(rng, 3)
+  init_noise = jax.random.uniform(rng_key1, (FLAGS.batch_size, 224, 224, 3))
+
+  # init_noise = np.load('../SQuant/rnd_inpt.npy')
+  # init_noise = jnp.moveaxis(init_noise, (0,1,2,3), (0,3,1,2))
+
+  _, new_state = state.apply_fn({'params': state.params,
+                                 'quant_params': state.quant_params,
+                                 'batch_stats': state.batch_stats,
+                                 },
+                                init_noise,
+                                mutable=['quant_params',],
+                                no_quant=False,
+                                )
+  state = TrainState.create(
+      apply_fn=state.apply_fn,
+      params=state.params,
+      quant_params=new_state['quant_params'],
+      tx=None,
+      batch_stats=state.batch_stats,
+  )
+
   state = jax_utils.replicate(state)
+  p_eval_step = jax.pmap(functools.partial(
+      eval_step, no_quant=False), axis_name='batch')
 
   # eval quant
   eval_metrics = []
