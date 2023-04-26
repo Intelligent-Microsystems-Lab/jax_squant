@@ -297,7 +297,8 @@ def squant_fn(tensor, bit, is_perchannel, squant_k, squant_c, scale_off=False,
   if shape_c is False:
     # reshuffle axis to match pytorch.
     if len(tensor.shape) == 4:
-      tensor = jnp.moveaxis(tensor, (0, 1, 2, 3), (3, 2, 0, 1))
+      # tensor = jnp.moveaxis(tensor, (0, 1, 2, 3), (3, 2, 0, 1))
+      tensor = jnp.moveaxis(tensor, (0, 1, 3, 2), (3, 2, 0, 1))
     else:
       tensor = jnp.transpose(tensor)
 
@@ -330,7 +331,8 @@ def squant_fn(tensor, bit, is_perchannel, squant_k, squant_c, scale_off=False,
   if shape_c is False:
     # bring tensor back into og shape
     if len(tensor.shape) == 4:
-      quant_tensor = jnp.moveaxis(quant_tensor, (0, 1, 2, 3), (2, 3, 1, 0))
+      # quant_tensor = jnp.moveaxis(quant_tensor, (0, 1, 2, 3), (2, 3, 1, 0))
+      quant_tensor = jnp.moveaxis(quant_tensor,  (3, 2, 0, 1),(0, 1, 3, 2))
     else:
       quant_tensor = jnp.transpose(quant_tensor)
 

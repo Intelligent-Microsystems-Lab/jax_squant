@@ -39,7 +39,7 @@ from squant_flax import squant_fn, uniform_static
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer('rng', 69, 'Random seed.')
-flags.DEFINE_string('model', 'ResNet18', 'Model type.')
+flags.DEFINE_string('model', 'ResNet50', 'Model type.')
 flags.DEFINE_integer('batch_size', 256, 'Batch size.')
 flags.DEFINE_string(
     'tfds_data_dir', '/afs/crc.nd.edu/user/c/cschaef6/tensorflow_datasets', '')
@@ -48,8 +48,8 @@ flags.DEFINE_bool('cache', False, '')
 flags.DEFINE_bool('half_precision', False, '')
 
 flags.DEFINE_string('model_weights',
-                    'unit_test_data/res18_w.pt',
-                    # 'unit_test_data/res50.npy',
+                    # 'unit_test_data/res18_w.pt',
+                    'unit_test_data/res50.npy',
                     'Pretrained model weights location.')
 flags.DEFINE_integer('wb', 4, 'Weight bits.')
 flags.DEFINE_integer('ab', 4, 'Activation bits.')
@@ -120,22 +120,30 @@ class BottleneckResNetBlock(nn.Module):
 
   @nn.compact
   def __call__(self, x, no_quant):
-    # raise Exception('Not implemented for imgclsob pytorch weights.')
     residual = x
+
+    # quant inpt
+    x = self.quant_fn(sign=False)(x, no_quant=no_quant)
     y = self.conv(self.filters, (1, 1), strides=self.strides)(x)
     y = self.norm()(y)
     y = self.act(y)
 
+    # quant inpt
+    y = self.quant_fn(sign=False)(y, no_quant=no_quant)
     if self.strides == (2, 2):
       y = self.conv(self.filters, (3, 3), padding=((1, 1), (1, 1)))(y)
     else:
       y = self.conv(self.filters, (3, 3), self.strides)(y)
     y = self.norm()(y)
     y = self.act(y)
+
+    # quant inpt
+    y = self.quant_fn(sign=False)(y, no_quant=no_quant)
     y = self.conv(self.filters * 4, (1, 1))(y)
     y = self.norm(scale_init=nn.initializers.zeros_init())(y)
 
     if residual.shape != y.shape:
+      residual = self.quant_fn(sign=False)(residual, no_quant=no_quant)
       residual = self.conv(self.filters * 4, (1, 1),
                            self.strides, name='conv_proj')(residual)
       residual = self.norm(name='norm_proj')(residual)
@@ -166,7 +174,7 @@ class ResNet(nn.Module):
                              axis_name='batch')
 
     # quant inpt
-    x = self.quant_fn(sign=False)(x, no_quant=no_quant)
+    # x = self.quant_fn(sign=False)(x, no_quant=no_quant)
 
     _ = self.variable('quant_params', 'placeholder', jnp.zeros, (1,))
 
@@ -204,7 +212,8 @@ class ResNet(nn.Module):
     x = jnp.mean(x, axis=(1, 2))
 
     # quant inpt - always 8 bit
-    x = uniform_static(sign=False)(x, no_quant=no_quant)
+    x = uniform_static(bits=8, percent=FLAGS.sigma, sign=False,)(x, no_quant=no_quant)
+    # x = self.quant_fn(sign=False)(x, no_quant=no_quant)
 
     x = nn.Dense(self.num_classes, dtype=self.dtype)(x)
     x = jnp.asarray(x, self.dtype)
@@ -398,9 +407,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   rng, rng_key = jax.random.split(rng, 2)
   state = create_train_state(
       rng_key, config, model, image_size)
-  # restore pretrained NN
-  # state = restore_checkpoint(
-  #     state, '/afs/crc.nd.edu/user/c/cschaef6/pretrained_resnet/resnet18')
   if FLAGS.model == 'ResNet18':
     state = load_res18(state, FLAGS.model_weights)
   elif FLAGS.model == 'ResNet50':
@@ -411,19 +417,10 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   state = jax_utils.replicate(state)
   p_eval_step = jax.pmap(functools.partial(
       eval_step, no_quant=True), axis_name='batch')
-  # p_eval_step = functools.partial(eval_step, no_quant=True)
 
   eval_metrics = []
   for _ in range(steps_per_eval):
     eval_batch = next(eval_iter)
-
-    # # note: look for pmean again! and p_eval_step and replicated!
-    # # test = np.load('sample_inpt.npy')
-    # # test_tgt = np.load('sample_tgt.npy')
-    # test = jnp.ones((256,3,224,224))
-    # test_tgt = jnp.ones((256))
-    # eval_batch = {'image': jnp.moveaxis(jnp.array(test),(0, 1, 2, 3),
-    #   (0, 3, 1, 2)), 'label':test_tgt}
 
     metrics = p_eval_step(state, eval_batch)
     eval_metrics.append(metrics)
@@ -466,12 +463,9 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
       batch_stats=state.batch_stats,
   )
 
-  # calibrate activatin quant.
+  # calibrate activation quant.
   rng, rng_key1, rng_key2 = jax.random.split(rng, 3)
   init_noise = jax.random.uniform(rng_key1, (FLAGS.batch_size, 224, 224, 3))
-
-  # init_noise = np.load('../SQuant/rnd_inpt.npy')
-  # init_noise = jnp.moveaxis(init_noise, (0,1,2,3), (0,3,1,2))
 
   _, new_state = state.apply_fn({'params': state.params,
                                  'quant_params': state.quant_params,
@@ -497,12 +491,6 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   eval_metrics = []
   for _ in range(steps_per_eval):
     eval_batch = next(eval_iter)
-
-    # # note: look for pmean again!
-    # test = np.load('sample_inpt.npy')
-    # test_tgt = np.load('sample_tgt.npy')
-    # eval_batch = {'image': jnp.moveaxis(jnp.array(test),(0, 1, 2, 3),
-    #   (0, 3, 1, 2)), 'label':test_tgt}
 
     metrics = p_eval_step(state, eval_batch)
     eval_metrics.append(metrics)
