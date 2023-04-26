@@ -31,7 +31,8 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import input_pipeline
-from resnet_load_pretrained_weights import resnet_load_pretrained_weights
+from resnet_load_pretrained_weights import resnet_load_pretrained_weights as load_res18
+from load_res50 import resnet_load_pretrained_weights as load_res50
 from squant_flax import squant_fn, uniform_static
 
 
@@ -46,7 +47,9 @@ flags.DEFINE_string('dataset', 'imagenet2012:5.*.*', '')
 flags.DEFINE_bool('cache', False, '')
 flags.DEFINE_bool('half_precision', False, '')
 
-flags.DEFINE_string('model_weights', 'unit_test_data/res18_w.pt',
+flags.DEFINE_string('model_weights',
+                    'unit_test_data/res18_w.pt',
+                    # 'unit_test_data/res50.npy',
                     'Pretrained model weights location.')
 flags.DEFINE_integer('wb', 4, 'Weight bits.')
 flags.DEFINE_integer('ab', 4, 'Activation bits.')
@@ -113,15 +116,20 @@ class BottleneckResNetBlock(nn.Module):
   norm: ModuleDef
   act: Callable
   strides: Tuple[int, int] = (1, 1)
+  quant_fn: Callable = None
 
   @nn.compact
-  def __call__(self, x):
-    raise Exception('Not implemented for imgclsob pytorch weights.')
+  def __call__(self, x, no_quant):
+    # raise Exception('Not implemented for imgclsob pytorch weights.')
     residual = x
-    y = self.conv(self.filters, (1, 1))(x)
+    y = self.conv(self.filters, (1, 1), strides=self.strides)(x)
     y = self.norm()(y)
     y = self.act(y)
-    y = self.conv(self.filters, (3, 3), self.strides)(y)
+
+    if self.strides == (2, 2):
+      y = self.conv(self.filters, (3, 3), padding=((1, 1), (1, 1)))(y)
+    else:
+      y = self.conv(self.filters, (3, 3), self.strides)(y)
     y = self.norm()(y)
     y = self.act(y)
     y = self.conv(self.filters * 4, (1, 1))(y)
@@ -158,23 +166,27 @@ class ResNet(nn.Module):
                              axis_name='batch')
 
     # quant inpt
-    # x = self.quant_fn(sign = False)(x, no_quant = no_quant)
+    x = self.quant_fn(sign=False)(x, no_quant=no_quant)
+
+    _ = self.variable('quant_params', 'placeholder', jnp.zeros, (1,))
 
     x = conv(self.num_filters, (7, 7), (2, 2),
              padding=[(3, 3), (3, 3)],
              name='conv_init')(x)
 
     # Debugging
-    # test = np.load('inter.npy')
+    # test = np.load('../inter.npy')
     # np.testing.assert_allclose(jnp.moveaxis(jnp.array(test),(0, 1, 2, 3),
-    #   (0, 3, 1, 2)), x)
+    #      (0, 3, 1, 2)), x)
 
     x = norm(name='bn_init')(x)
     x = nn.relu(x)
-    # Max absolute difference: 3.8146973e-06
+    # Max absolute difference: 3.8146973e-06 ResNet18 (ones)
+    # Max absolute difference: 9.536743e-07 ResNet50
 
     x = nn.max_pool(x, (3, 3), strides=(2, 2), padding=((1, 0), (1, 0)),)
-    # Max absolute difference: 3.8146973e-06
+    # Max absolute difference: 3.8146973e-06 ResNet18
+    # Max absolute difference: 9.536743e-07 ResNet50 (ones)
 
     for i, block_size in enumerate(self.stage_sizes):
       for j in range(block_size):
@@ -185,10 +197,14 @@ class ResNet(nn.Module):
                            norm=norm,
                            act=self.act,
                            quant_fn=self.quant_fn)(x, no_quant=no_quant)
+        # block1 Max absolute difference: 2.1457672e-06 ResNet50 (ones)
+        # block2 Max absolute difference: 6.1392784e-06 ResNet50 (ones)
+        # block3 Max absolute difference: 7.688999e-06 ResNet50 (ones)
+
     x = jnp.mean(x, axis=(1, 2))
 
-    # quant inpt
-    x = self.quant_fn(sign=False)(x, no_quant=no_quant)
+    # quant inpt - always 8 bit
+    x = uniform_static(sign=False)(x, no_quant=no_quant)
 
     x = nn.Dense(self.num_classes, dtype=self.dtype)(x)
     x = jnp.asarray(x, self.dtype)
@@ -385,19 +401,27 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   # restore pretrained NN
   # state = restore_checkpoint(
   #     state, '/afs/crc.nd.edu/user/c/cschaef6/pretrained_resnet/resnet18')
-  state = resnet_load_pretrained_weights(state, FLAGS.model_weights)
+  if FLAGS.model == 'ResNet18':
+    state = load_res18(state, FLAGS.model_weights)
+  elif FLAGS.model == 'ResNet50':
+    state = load_res50(state, FLAGS.model_weights)
+  else:
+    raise Exception('Loading model method not implemented for: ' + FLAGS.model)
   logging.info('Model loaded successfully.')
   state = jax_utils.replicate(state)
   p_eval_step = jax.pmap(functools.partial(
       eval_step, no_quant=True), axis_name='batch')
+  # p_eval_step = functools.partial(eval_step, no_quant=True)
 
   eval_metrics = []
   for _ in range(steps_per_eval):
     eval_batch = next(eval_iter)
 
-    # # note: look for pmean again!
-    # test = np.load('sample_inpt.npy')
-    # test_tgt = np.load('sample_tgt.npy')
+    # # note: look for pmean again! and p_eval_step and replicated!
+    # # test = np.load('sample_inpt.npy')
+    # # test_tgt = np.load('sample_tgt.npy')
+    # test = jnp.ones((256,3,224,224))
+    # test_tgt = jnp.ones((256))
     # eval_batch = {'image': jnp.moveaxis(jnp.array(test),(0, 1, 2, 3),
     #   (0, 3, 1, 2)), 'label':test_tgt}
 

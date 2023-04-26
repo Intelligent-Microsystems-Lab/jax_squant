@@ -517,7 +517,8 @@ class SQuantFlaxTest(parameterized.TestCase):
     Unit test to match PyTorch input quant to flax input quant.
     """
     data = np.load('../squant_unit_test_too_big/' + inpt_path)
-    out = np.load('../squant_unit_test_too_big/' + inpt_path.split('.')[0] + '_out.npy')
+    out = np.load('../squant_unit_test_too_big/'
+                  + inpt_path.split('.')[0] + '_out.npy')
 
     params = uniform_static(bits=bits, percent=sigma, sign=sign).init({}, data)
     test = uniform_static(bits=bits, percent=sigma,
